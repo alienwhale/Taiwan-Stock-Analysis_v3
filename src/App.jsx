@@ -4,7 +4,7 @@ import { useState, useEffect, useMemo } from "react";
 //  ⚠️  部署前請把下面這行換成你的 Google Sheet URL
 //  執行 GAS 的 getPublicCsvUrl() 後複製 log 的網址
 // ══════════════════════════════════════════════════
-const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrrO6l9FPJo1qdcEGO3X6OkqiV3qjt4xiQ04xAW3zJObl4z-W162x4yTRLfsiQMZYWTK64fXeECWvO/pub?output=csv";
+const SHEET_CSV_URL = "const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1CE5ZJUBwkoicw5ZZJmKC2Gtwe9Z-dZEdkjhhrl1_GVM/export?format=csv&gid=2111487283";
 
 // 多個 CORS proxy 備用，依序嘗試
 const CORS_PROXIES = [
