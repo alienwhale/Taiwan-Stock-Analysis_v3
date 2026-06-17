@@ -1,15 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 
-// ══════════════════════════════════════════════════
-//  ⚠️  部署前請把下面這行換成你的 Google Sheet URL
-//  執行 GAS 的 getPublicCsvUrl() 後複製 log 的網址
-const SHEET_CSV_URL = "/api/prices";
-// 多個 CORS proxy 備用，依序嘗試
-const CORS_PROXIES = [
-  (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url) => `https://cors-anywhere.herokuapp.com/${url}`,
-];
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrrO6l9FPJo1qdcEGO3X6OkqiV3qjt4xiQ04xAW3zJObl4z-W162x4yTRLfsiQMZYWTK64fXeECWvO/pub?gid=2111487283&single=true&output=csv";
 
 const STOCK_META = [
   {id:"2330",name:"台積電",cat:"核心製造",role:"晶圓代工龍頭"},
@@ -227,7 +218,6 @@ const STOCK_META = [
   {id:"2891",name:"中信金",cat:"金融",role:"金控"},
 ];
 
-// ── CSV 解析（處理含逗號欄位）──────────────────
 function parseCSVLine(line) {
   const result = [];
   let cur = "", inQ = false;
@@ -248,34 +238,20 @@ function parseCSV(text) {
     if (!line.trim()) return;
     const cols = parseCSVLine(line);
     if (cols.length < 7) return;
-    const id        = cols[0].replace(/"/g, "").trim();
+    const id        = cols[0].replace(/"/g,"").trim();
     const price     = parseFloat(cols[1]) || 0;
     const change    = parseFloat(cols[2]) || 0;
     const changePct = parseFloat(cols[3]) || 0;
     const high      = parseFloat(cols[4]) || 0;
     const low       = parseFloat(cols[5]) || 0;
     const vol       = parseInt(cols[6])   || 0;
-    const updated   = (cols[7] || "").replace(/"/g, "").trim();
+    const updated   = (cols[7]||"").replace(/"/g,"").trim();
     if (id) result[id] = { price, change, changePct, high, low, vol, updated };
   });
   return result;
 }
 
-// ── 多 proxy 備援抓取 ────────────────────────────
-async function fetchWithFallback(url) {
-  for (const proxy of CORS_PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue;
-      const text = await res.text();
-      if (text.includes(",")) return text; // 簡單驗證是 CSV
-    } catch (_) { /* 嘗試下一個 */ }
-  }
-  throw new Error("所有 proxy 均無法連線，請確認 Sheet 已設為公開");
-}
-
 const CC = v => v > 0 ? "#00f5a0" : v < 0 ? "#ff5252" : "#888";
-const isConfigured = !SHEET_CSV_URL.includes("YOUR_SHEET_CSV_URL_HERE");
 
 export default function App() {
   const [prices, setPrices]       = useState({});
@@ -292,10 +268,11 @@ export default function App() {
   const [formErr, setFormErr]     = useState("");
 
   async function fetchPrices() {
-    if (!isConfigured) return;
     setLoading(true); setError("");
     try {
-      const text = await fetchWithFallback(SHEET_CSV_URL);
+      const res = await fetch("/api/prices");
+      if (!res.ok) throw new Error("API 回應錯誤 " + res.status);
+      const text = await res.text();
       const data = parseCSV(text);
       if (Object.keys(data).length === 0) throw new Error("資料格式異常，請確認 Sheet 有資料");
       setPrices(data);
@@ -326,10 +303,7 @@ export default function App() {
     if (!form.id.trim())   { setFormErr("請輸入代號"); return; }
     if (!form.name.trim()) { setFormErr("請輸入名稱"); return; }
     if (allStocks.find(s => s.id === form.id.trim())) { setFormErr("此代號已存在"); return; }
-    const next = [...custom, {
-      id: form.id.trim(), name: form.name.trim(),
-      cat: form.cat, role: form.role.trim() || "自訂"
-    }];
+    const next = [...custom, {id:form.id.trim(), name:form.name.trim(), cat:form.cat, role:form.role.trim()||"自訂"}];
     setCustom(next);
     try { localStorage.setItem("twstock_custom", JSON.stringify(next)); } catch(_) {}
     setForm({id:"", name:"", cat:"核心製造", role:""}); setFormErr(""); setShowAdd(false);
@@ -375,27 +349,21 @@ export default function App() {
           <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>
             共 <span style={{color:"#00f5a0",fontWeight:700}}>{allStocks.length}</span> 支 · 19大產業
             {custom.length > 0 && <span style={{color:"#ffd54f"}}> · 自訂 {custom.length} 支</span>}
-            {lastFetch && <span> · 資料更新 {lastFetch}</span>}
+            {lastFetch && <span> · 更新 {lastFetch}</span>}
           </div>
         </div>
         <div style={{display:"flex",gap:8}}>
-          <button className="btn" onClick={fetchPrices} disabled={loading || !isConfigured}
-            title={!isConfigured ? "請先設定 SHEET_CSV_URL" : ""}
-            style={{padding:"7px 14px",borderRadius:6,border:"1px solid #1e3a5f",color: isConfigured?"#4a8aaa":"#2a4a5a",fontSize:13,fontFamily:"'Noto Sans TC'"}}>
+          <button className="btn" onClick={fetchPrices} disabled={loading}
+            style={{padding:"7px 14px",borderRadius:6,border:"1px solid #1e3a5f",color:"#4a8aaa",fontSize:13,fontFamily:"'Noto Sans TC'"}}>
             {loading ? <span className="spin">⟳</span> : "⟳"} 更新
           </button>
-          <button className="btn" onClick={() => setShowAdd(true)} style={{background:"#00f5a0",color:"#070b12",padding:"7px 16px",borderRadius:6,fontWeight:700,fontSize:13,fontFamily:"'Noto Sans TC'"}}>
+          <button className="btn" onClick={() => setShowAdd(true)}
+            style={{background:"#00f5a0",color:"#070b12",padding:"7px 16px",borderRadius:6,fontWeight:700,fontSize:13,fontFamily:"'Noto Sans TC'"}}>
             ＋ 新增股票
           </button>
         </div>
       </div>
 
-      {/* 提示橫幅 */}
-      {!isConfigured && (
-        <div style={{background:"#1a1400",borderBottom:"1px solid #3a2a00",padding:"9px 18px",fontSize:12,color:"#ffd54f",fontFamily:"'Noto Sans TC'"}}>
-          ⚠️ 尚未連接 Google Sheet，目前只顯示股票清單（無股價）。完成 GAS 設定後，將程式碼第 6 行的 <b>SHEET_CSV_URL</b> 換成你的網址即可。
-        </div>
-      )}
       {error && (
         <div style={{background:"#1a0000",borderBottom:"1px solid #3a0000",padding:"9px 18px",fontSize:12,color:"#ff8a65",fontFamily:"'Noto Sans TC'"}}>
           ❌ {error}
@@ -429,9 +397,7 @@ export default function App() {
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
             <thead>
               <tr style={{background:"#060a10",borderBottom:"1px solid #192d44"}}>
-                {["代號","名稱","產業","角色",
-                  ...(isConfigured ? ["股價","漲跌","漲跌%","最高","最低","量(張)"] : []),
-                  ""].map(h => (
+                {["代號","名稱","產業","角色","股價","漲跌","漲跌%","最高","最低","量(張)",""].map(h => (
                   <th key={h} style={{
                     padding:"8px 11px", background:"#060a10",
                     textAlign:["代號","名稱","產業","角色"].includes(h)?"left":"right",
@@ -443,10 +409,10 @@ export default function App() {
             </thead>
             <tbody>
               {filtered.map((s, i) => {
-                const p   = prices[s.id];
-                const hp  = p && p.price > 0;
+                const p  = prices[s.id];
+                const hp = p && p.price > 0;
                 return (
-                  <tr key={s.id + i} className="row" style={{borderBottom:"1px solid #0c1620"}}>
+                  <tr key={s.id+i} className="row" style={{borderBottom:"1px solid #0c1620"}}>
                     <td style={{padding:"8px 11px"}}>
                       <span style={{color:"#00c876",fontWeight:700}}>{s.id}</span>
                       {isCustom(s.id) && (
@@ -458,28 +424,24 @@ export default function App() {
                       <span style={{fontSize:10,padding:"2px 7px",borderRadius:10,background:"#1a2d45",color:"#5a8aaa",fontFamily:"'Noto Sans TC'",whiteSpace:"nowrap"}}>{s.cat}</span>
                     </td>
                     <td style={{padding:"8px 11px",color:"#3a6a8a",fontSize:11,fontFamily:"'Noto Sans TC'",maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.role}</td>
-
-                    {isConfigured && <>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:"#e0e8f0",fontWeight:600}}>
-                        {loading ? "…" : hp ? p.price.toFixed(2) : <span style={{color:"#2a4a5a"}}>—</span>}
-                      </td>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.change):"#2a4a5a",fontWeight:600}}>
-                        {loading ? "…" : hp ? (p.change > 0 ? "+" : "") + p.change.toFixed(2) : "—"}
-                      </td>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.changePct):"#2a4a5a",fontWeight:700}}>
-                        {loading ? "…" : hp ? (p.changePct > 0 ? "▲" : "▼") + Math.abs(p.changePct).toFixed(2) + "%" : "—"}
-                      </td>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
-                        {loading ? "…" : hp ? p.high.toFixed(2) : "—"}
-                      </td>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
-                        {loading ? "…" : hp ? p.low.toFixed(2) : "—"}
-                      </td>
-                      <td style={{padding:"8px 11px",textAlign:"right",color:"#4a7a9a"}}>
-                        {loading ? "…" : hp ? p.vol.toLocaleString() : "—"}
-                      </td>
-                    </>}
-
+                    <td style={{padding:"8px 11px",textAlign:"right",color:"#e0e8f0",fontWeight:600}}>
+                      {loading ? "…" : hp ? p.price.toFixed(2) : <span style={{color:"#2a4a5a"}}>—</span>}
+                    </td>
+                    <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.change):"#2a4a5a",fontWeight:600}}>
+                      {loading ? "…" : hp ? (p.change>0?"+":"")+p.change.toFixed(2) : "—"}
+                    </td>
+                    <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.changePct):"#2a4a5a",fontWeight:700}}>
+                      {loading ? "…" : hp ? (p.changePct>0?"▲":"▼")+Math.abs(p.changePct).toFixed(2)+"%" : "—"}
+                    </td>
+                    <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
+                      {loading ? "…" : hp ? p.high.toFixed(2) : "—"}
+                    </td>
+                    <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
+                      {loading ? "…" : hp ? p.low.toFixed(2) : "—"}
+                    </td>
+                    <td style={{padding:"8px 11px",textAlign:"right",color:"#4a7a9a"}}>
+                      {loading ? "…" : hp ? p.vol.toLocaleString() : "—"}
+                    </td>
                     <td style={{padding:"8px 11px",textAlign:"right"}}>
                       {isCustom(s.id) && (
                         <button className="btn" onClick={() => removeCustom(s.id)}
@@ -490,7 +452,7 @@ export default function App() {
                 );
               })}
               {filtered.length === 0 && (
-                <tr><td colSpan={isConfigured?11:5} style={{padding:40,textAlign:"center",color:"#3a6a8a",fontFamily:"'Noto Sans TC'"}}>沒有符合條件的股票</td></tr>
+                <tr><td colSpan={11} style={{padding:40,textAlign:"center",color:"#3a6a8a",fontFamily:"'Noto Sans TC'"}}>沒有符合條件的股票</td></tr>
               )}
             </tbody>
           </table>
