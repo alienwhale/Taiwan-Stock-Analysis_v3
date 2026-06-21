@@ -1,6 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
-
-const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrrO6l9FPJo1qdcEGO3X6OkqiV3qjt4xiQ04xAW3zJObl4z-W162x4yTRLfsiQMZYWTK64fXeECWvO/pub?gid=2111487283&single=true&output=csv";
+import { useState, useEffect, useMemo, useRef } from "react";
 
 const STOCK_META = [
   {id:"2330",name:"台積電",cat:"核心製造",role:"晶圓代工龍頭"},
@@ -253,6 +251,245 @@ function parseCSV(text) {
 
 const CC = v => v > 0 ? "#00f5a0" : v < 0 ? "#ff5252" : "#888";
 
+// ── K線聚合：日K → 週K / 月K ──────────────────────
+function aggregateCandles(daily, unit) {
+  if (unit === "day") return daily;
+
+  const groups = {};
+  daily.forEach(d => {
+    const date = new Date(d.date);
+    let key;
+    if (unit === "week") {
+      const day = date.getDay();
+      const monday = new Date(date);
+      monday.setDate(date.getDate() - ((day + 6) % 7));
+      key = monday.toISOString().split("T")[0];
+    } else { // month
+      key = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`;
+    }
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(d);
+  });
+
+  return Object.keys(groups).sort().map(key => {
+    const items = groups[key].sort((a,b) => new Date(a.date) - new Date(b.date));
+    return {
+      date: items[0].date,
+      open: items[0].open,
+      high: Math.max(...items.map(i => i.high)),
+      low: Math.min(...items.map(i => i.low)),
+      close: items[items.length-1].close,
+      volume: items.reduce((s,i) => s + i.volume, 0),
+    };
+  });
+}
+
+// ── 依時間範圍篩選 ─────────────────────────────────
+function filterByRange(data, range) {
+  const cutoff = new Date();
+  if (range === "3m") cutoff.setMonth(cutoff.getMonth() - 3);
+  else if (range === "6m") cutoff.setMonth(cutoff.getMonth() - 6);
+  else if (range === "1y") cutoff.setFullYear(cutoff.getFullYear() - 1);
+  return data.filter(d => new Date(d.date) >= cutoff);
+}
+
+// ── K線圖 Canvas 繪製元件 ───────────────────────────
+function CandleChart({ data }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !data || data.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    const padL = 55, padR = 15, padT = 15, padB = 50;
+    const chartW = W - padL - padR;
+    const chartH = (H - padT - padB) * 0.72;
+    const volH   = (H - padT - padB) * 0.22;
+    const volTop = padT + chartH + 14;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#070b12";
+    ctx.fillRect(0, 0, W, H);
+
+    const highs = data.map(d => d.high);
+    const lows  = data.map(d => d.low);
+    const maxP  = Math.max(...highs);
+    const minP  = Math.min(...lows);
+    const pad   = (maxP - minP) * 0.08 || 1;
+    const yMax  = maxP + pad, yMin = minP - pad;
+    const maxV  = Math.max(...data.map(d => d.volume), 1);
+
+    const xStep = chartW / data.length;
+    const candleW = Math.max(1, xStep * 0.62);
+
+    const yToPx  = v => padT + chartH - ((v - yMin) / (yMax - yMin)) * chartH;
+    const volToPx = v => volTop + volH - (v / maxV) * volH;
+
+    // 格線 + Y軸刻度
+    ctx.strokeStyle = "#192d44";
+    ctx.fillStyle = "#3a6a8a";
+    ctx.font = "10px 'IBM Plex Mono'";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const v = yMin + (yMax - yMin) * (i / 4);
+      const y = yToPx(v);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      ctx.fillText(v.toFixed(1), 4, y + 3);
+    }
+
+    // X軸日期標籤（取5個點）
+    const labelCount = Math.min(6, data.length);
+    for (let i = 0; i < labelCount; i++) {
+      const idx = Math.floor((data.length - 1) * (i / (labelCount - 1 || 1)));
+      const x = padL + idx * xStep + candleW / 2;
+      const dateStr = data[idx].date.slice(5); // MM-DD
+      ctx.fillStyle = "#3a6a8a";
+      ctx.fillText(dateStr, x - 14, H - padB + 14);
+    }
+
+    // K線蠟燭
+    data.forEach((d, i) => {
+      const x = padL + i * xStep + (xStep - candleW) / 2;
+      const isUp = d.close >= d.open;
+      const color = isUp ? "#00f5a0" : "#ff5252";
+
+      // 上下影線
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + candleW/2, yToPx(d.high));
+      ctx.lineTo(x + candleW/2, yToPx(d.low));
+      ctx.stroke();
+
+      // 實體
+      const openY  = yToPx(d.open);
+      const closeY = yToPx(d.close);
+      const bodyTop = Math.min(openY, closeY);
+      const bodyH   = Math.max(1, Math.abs(closeY - openY));
+      ctx.fillStyle = color;
+      ctx.fillRect(x, bodyTop, candleW, bodyH);
+
+      // 成交量柱
+      ctx.fillStyle = color + "99";
+      const vY = volToPx(d.volume);
+      ctx.fillRect(x, vY, candleW, volTop + volH - vY);
+    });
+
+    // 成交量標籤
+    ctx.fillStyle = "#3a6a8a";
+    ctx.font = "9px 'IBM Plex Mono'";
+    ctx.fillText("量", 4, volTop + 10);
+  }, [data]);
+
+  return <canvas ref={canvasRef} width={760} height={360} style={{ width: "100%", maxWidth: 760, height: "auto", display: "block" }} />;
+}
+
+// ── 個股詳情 Modal ──────────────────────────────────
+function StockModal({ stock, priceInfo, onClose }) {
+  const [rawData, setRawData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [unit, setUnit] = useState("day");   // day | week | month
+  const [range, setRange] = useState("3m");  // 3m | 6m | 1y
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError("");
+    fetch(`/api/candles?symbol=${stock.id}`)
+      .then(res => res.json())
+      .then(json => {
+        if (cancelled) return;
+        if (json.error) { setError(json.error); setLoading(false); return; }
+        const candles = (json.data || json.candles || []).map(c => ({
+          date: c.date,
+          open: c.open, high: c.high, low: c.low, close: c.close,
+          volume: c.volume || 0,
+        })).sort((a,b) => new Date(a.date) - new Date(b.date));
+        setRawData(candles);
+        setLoading(false);
+      })
+      .catch(e => { if (!cancelled) { setError(e.message); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [stock.id]);
+
+  const displayData = useMemo(() => {
+    if (!rawData) return [];
+    const ranged = filterByRange(rawData, range);
+    return aggregateCandles(ranged, unit);
+  }, [rawData, unit, range]);
+
+  const UNIT_OPTS  = [["day","日"],["week","週"],["month","月"]];
+  const RANGE_OPTS = [["3m","3個月"],["6m","半年"],["1y","1年"]];
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.7)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background:"#0c1620", border:"1px solid #1e3a5f", borderRadius:10, width:"100%", maxWidth:820, maxHeight:"92vh", overflow:"auto", padding:20 }}>
+        {/* Header */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:14 }}>
+          <div>
+            <div style={{ display:"flex", alignItems:"baseline", gap:10 }}>
+              <span style={{ fontSize:20, fontWeight:700, color:"#e0e8f0" }}>{stock.id}</span>
+              <span style={{ fontSize:15, color:"#8ab0c0", fontFamily:"'Noto Sans TC'" }}>{stock.name}</span>
+            </div>
+            <div style={{ fontSize:11, color:"#3a6a8a", fontFamily:"'Noto Sans TC'", marginTop:2 }}>{stock.cat} · {stock.role}</div>
+          </div>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:"#3a6a8a", fontSize:24, cursor:"pointer", lineHeight:1 }}>×</button>
+        </div>
+
+        {/* 即時報價列 */}
+        {priceInfo && priceInfo.price > 0 && (
+          <div style={{ display:"flex", gap:20, marginBottom:14, padding:"10px 14px", background:"#070b12", borderRadius:8, flexWrap:"wrap" }}>
+            <div><div style={{ fontSize:10, color:"#3a6a8a" }}>股價</div><div style={{ fontSize:18, fontWeight:700, color:"#e0e8f0" }}>{priceInfo.price.toFixed(2)}</div></div>
+            <div><div style={{ fontSize:10, color:"#3a6a8a" }}>漲跌</div><div style={{ fontSize:14, fontWeight:600, color:CC(priceInfo.change) }}>{priceInfo.change>0?"+":""}{priceInfo.change.toFixed(2)} ({priceInfo.changePct>0?"+":""}{priceInfo.changePct.toFixed(2)}%)</div></div>
+            <div><div style={{ fontSize:10, color:"#3a6a8a" }}>最高</div><div style={{ fontSize:14, color:"#7a9ab8" }}>{priceInfo.high.toFixed(2)}</div></div>
+            <div><div style={{ fontSize:10, color:"#3a6a8a" }}>最低</div><div style={{ fontSize:14, color:"#7a9ab8" }}>{priceInfo.low.toFixed(2)}</div></div>
+          </div>
+        )}
+
+        {/* K棒單位 + 範圍切換 */}
+        <div style={{ display:"flex", justifyContent:"space-between", flexWrap:"wrap", gap:10, marginBottom:12 }}>
+          <div style={{ display:"flex", gap:4 }}>
+            {UNIT_OPTS.map(([k,l]) => (
+              <button key={k} onClick={() => setUnit(k)} style={{
+                padding:"5px 14px", borderRadius:6, fontSize:12, cursor:"pointer", fontFamily:"'Noto Sans TC'",
+                border:"1px solid " + (unit===k ? "#00f5a0" : "#1e3a5f"),
+                background: unit===k ? "#00f5a0" : "transparent",
+                color: unit===k ? "#070b12" : "#4a8aaa",
+              }}>{l}K</button>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:4 }}>
+            {RANGE_OPTS.map(([k,l]) => (
+              <button key={k} onClick={() => setRange(k)} style={{
+                padding:"5px 14px", borderRadius:6, fontSize:12, cursor:"pointer", fontFamily:"'Noto Sans TC'",
+                border:"1px solid " + (range===k ? "#4fc3f7" : "#1e3a5f"),
+                background: range===k ? "#4fc3f7" : "transparent",
+                color: range===k ? "#070b12" : "#4a8aaa",
+              }}>{l}</button>
+            ))}
+          </div>
+        </div>
+
+        {/* K線圖 */}
+        <div style={{ background:"#070b12", borderRadius:8, padding:8, marginBottom:14, minHeight:200 }}>
+          {loading && <div style={{ textAlign:"center", padding:60, color:"#3a6a8a", fontFamily:"'Noto Sans TC'" }}>載入K線資料中...</div>}
+          {error && <div style={{ textAlign:"center", padding:60, color:"#ff8a65", fontFamily:"'Noto Sans TC'" }}>❌ {error}</div>}
+          {!loading && !error && displayData.length === 0 && <div style={{ textAlign:"center", padding:60, color:"#3a6a8a", fontFamily:"'Noto Sans TC'" }}>無資料</div>}
+          {!loading && !error && displayData.length > 0 && <CandleChart data={displayData} />}
+        </div>
+
+        {!loading && !error && displayData.length > 0 && (
+          <div style={{ fontSize:11, color:"#3a6a8a", fontFamily:"'Noto Sans TC'", textAlign:"right" }}>
+            共 {displayData.length} 根{unit==="day"?"日":unit==="week"?"週":"月"}K · 資料來源 Fugle
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [prices, setPrices]       = useState({});
   const [loading, setLoading]     = useState(false);
@@ -266,6 +503,7 @@ export default function App() {
   const [showAdd, setShowAdd]     = useState(false);
   const [form, setForm]           = useState({id:"", name:"", cat:"核心製造", role:""});
   const [formErr, setFormErr]     = useState("");
+  const [selectedStock, setSelectedStock] = useState(null); // 點擊的股票（開Modal）
 
   async function fetchPrices() {
     setLoading(true); setError("");
@@ -318,7 +556,7 @@ export default function App() {
   const isCustom = id => custom.some(s => s.id === id);
 
   return (
-    <div style={{minHeight:"100vh", background:"#070b12", color:"#dce8f0", fontFamily:"'IBM Plex Mono','Courier New',monospace"}}>
+    <div style={{ minHeight:"100vh", background:"#070b12", color:"#dce8f0", fontFamily:"'IBM Plex Mono','Courier New',monospace" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600&family=Noto+Sans+TC:wght@300;400;700&display=swap');
         *{box-sizing:border-box;margin:0;padding:0;}
@@ -326,8 +564,8 @@ export default function App() {
         ::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:2px;}
         .btn{background:none;border:none;cursor:pointer;font-family:inherit;transition:all .18s;}
         .btn:hover{opacity:.75;}
-        .row{transition:background .12s;}
-        .row:hover{background:rgba(0,245,160,.04)!important;}
+        .row{transition:background .12s;cursor:pointer;}
+        .row:hover{background:rgba(0,245,160,.06)!important;}
         .inp{background:#0c1620;border:1px solid #1e3a5f;color:#dce8f0;padding:6px 10px;border-radius:5px;font-family:inherit;font-size:13px;outline:none;width:100%;}
         .inp:focus{border-color:#00f5a0;}
         .chip{padding:4px 10px;border-radius:20px;font-size:11px;cursor:pointer;border:1px solid transparent;font-family:inherit;background:none;transition:all .15s;}
@@ -343,43 +581,43 @@ export default function App() {
       `}</style>
 
       {/* Header */}
-      <div style={{background:"#060a10",borderBottom:"1px solid #192d44",padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div style={{ background:"#060a10", borderBottom:"1px solid #192d44", padding:"13px 18px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
         <div>
-          <div style={{fontSize:17,fontWeight:700,color:"#00f5a0",fontFamily:"'Noto Sans TC'",letterSpacing:1}}>📋 台股追蹤清單</div>
-          <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>
+          <div style={{ fontSize:17, fontWeight:700, color:"#00f5a0", fontFamily:"'Noto Sans TC'", letterSpacing:1 }}>📋 台股追蹤清單</div>
+          <div style={{ fontSize:10, color:"#3a6a8a", marginTop:2 }}>
             共 <span style={{color:"#00f5a0",fontWeight:700}}>{allStocks.length}</span> 支 · 19大產業
             {custom.length > 0 && <span style={{color:"#ffd54f"}}> · 自訂 {custom.length} 支</span>}
             {lastFetch && <span> · 更新 {lastFetch}</span>}
           </div>
         </div>
-        <div style={{display:"flex",gap:8}}>
+        <div style={{ display:"flex", gap:8 }}>
           <button className="btn" onClick={fetchPrices} disabled={loading}
-            style={{padding:"7px 14px",borderRadius:6,border:"1px solid #1e3a5f",color:"#4a8aaa",fontSize:13,fontFamily:"'Noto Sans TC'"}}>
+            style={{ padding:"7px 14px", borderRadius:6, border:"1px solid #1e3a5f", color:"#4a8aaa", fontSize:13, fontFamily:"'Noto Sans TC'" }}>
             {loading ? <span className="spin">⟳</span> : "⟳"} 更新
           </button>
           <button className="btn" onClick={() => setShowAdd(true)}
-            style={{background:"#00f5a0",color:"#070b12",padding:"7px 16px",borderRadius:6,fontWeight:700,fontSize:13,fontFamily:"'Noto Sans TC'"}}>
+            style={{ background:"#00f5a0", color:"#070b12", padding:"7px 16px", borderRadius:6, fontWeight:700, fontSize:13, fontFamily:"'Noto Sans TC'" }}>
             ＋ 新增股票
           </button>
         </div>
       </div>
 
       {error && (
-        <div style={{background:"#1a0000",borderBottom:"1px solid #3a0000",padding:"9px 18px",fontSize:12,color:"#ff8a65",fontFamily:"'Noto Sans TC'"}}>
+        <div style={{ background:"#1a0000", borderBottom:"1px solid #3a0000", padding:"9px 18px", fontSize:12, color:"#ff8a65", fontFamily:"'Noto Sans TC'" }}>
           ❌ {error}
         </div>
       )}
 
       {/* 篩選列 */}
-      <div style={{padding:"12px 16px",background:"#060a10",borderBottom:"1px solid #192d44"}}>
-        <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center",flexWrap:"wrap"}}>
+      <div style={{ padding:"12px 16px", background:"#060a10", borderBottom:"1px solid #192d44" }}>
+        <div style={{ display:"flex", gap:8, marginBottom:10, alignItems:"center", flexWrap:"wrap" }}>
           <input className="inp" placeholder="搜尋代號 / 名稱 / 角色..." value={q}
-            onChange={e => setQ(e.target.value)} style={{maxWidth:240,fontSize:12}}/>
-          <span style={{fontSize:11,color:"#3a6a8a",whiteSpace:"nowrap"}}>
+            onChange={e => setQ(e.target.value)} style={{ maxWidth:240, fontSize:12 }}/>
+          <span style={{ fontSize:11, color:"#3a6a8a", whiteSpace:"nowrap" }}>
             顯示 <span style={{color:"#00f5a0",fontWeight:700}}>{filtered.length}</span> 支
           </span>
         </div>
-        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+        <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
           {allCats.map(c => (
             <button key={c} className="chip" onClick={() => setCat(c)} style={{
               color: cat===c ? "#070b12" : "#4a8aaa",
@@ -392,11 +630,11 @@ export default function App() {
       </div>
 
       {/* 股票表格 */}
-      <div style={{padding:"14px 16px",maxWidth:1200,margin:"0 auto"}}>
-        <div className="card fu" style={{overflow:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+      <div style={{ padding:"14px 16px", maxWidth:1200, margin:"0 auto" }}>
+        <div className="card fu" style={{ overflow:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
             <thead>
-              <tr style={{background:"#060a10",borderBottom:"1px solid #192d44"}}>
+              <tr style={{ background:"#060a10", borderBottom:"1px solid #192d44" }}>
                 {["代號","名稱","產業","角色","股價","漲跌","漲跌%","最高","最低","量(張)",""].map(h => (
                   <th key={h} style={{
                     padding:"8px 11px", background:"#060a10",
@@ -412,47 +650,47 @@ export default function App() {
                 const p  = prices[s.id];
                 const hp = p && p.price > 0;
                 return (
-                  <tr key={s.id+i} className="row" style={{borderBottom:"1px solid #0c1620"}}>
-                    <td style={{padding:"8px 11px"}}>
-                      <span style={{color:"#00c876",fontWeight:700}}>{s.id}</span>
+                  <tr key={s.id+i} className="row" onClick={() => setSelectedStock(s)} style={{ borderBottom:"1px solid #0c1620" }}>
+                    <td style={{ padding:"8px 11px" }}>
+                      <span style={{ color:"#00c876", fontWeight:700 }}>{s.id}</span>
                       {isCustom(s.id) && (
-                        <span className="tag" style={{background:"#ffd54f18",color:"#ffd54f",border:"1px solid #ffd54f30",marginLeft:5}}>自訂</span>
+                        <span className="tag" style={{ background:"#ffd54f18", color:"#ffd54f", border:"1px solid #ffd54f30", marginLeft:5 }}>自訂</span>
                       )}
                     </td>
-                    <td style={{padding:"8px 11px",color:"#e0e8f0",fontFamily:"'Noto Sans TC'",fontWeight:500,whiteSpace:"nowrap"}}>{s.name}</td>
-                    <td style={{padding:"8px 11px"}}>
-                      <span style={{fontSize:10,padding:"2px 7px",borderRadius:10,background:"#1a2d45",color:"#5a8aaa",fontFamily:"'Noto Sans TC'",whiteSpace:"nowrap"}}>{s.cat}</span>
+                    <td style={{ padding:"8px 11px", color:"#e0e8f0", fontFamily:"'Noto Sans TC'", fontWeight:500, whiteSpace:"nowrap" }}>{s.name}</td>
+                    <td style={{ padding:"8px 11px" }}>
+                      <span style={{ fontSize:10, padding:"2px 7px", borderRadius:10, background:"#1a2d45", color:"#5a8aaa", fontFamily:"'Noto Sans TC'", whiteSpace:"nowrap" }}>{s.cat}</span>
                     </td>
-                    <td style={{padding:"8px 11px",color:"#3a6a8a",fontSize:11,fontFamily:"'Noto Sans TC'",maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.role}</td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:"#e0e8f0",fontWeight:600}}>
+                    <td style={{ padding:"8px 11px", color:"#3a6a8a", fontSize:11, fontFamily:"'Noto Sans TC'", maxWidth:160, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.role}</td>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:"#e0e8f0", fontWeight:600 }}>
                       {loading ? "…" : hp ? p.price.toFixed(2) : <span style={{color:"#2a4a5a"}}>—</span>}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.change):"#2a4a5a",fontWeight:600}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:hp?CC(p.change):"#2a4a5a", fontWeight:600 }}>
                       {loading ? "…" : hp ? (p.change>0?"+":"")+p.change.toFixed(2) : "—"}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:hp?CC(p.changePct):"#2a4a5a",fontWeight:700}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:hp?CC(p.changePct):"#2a4a5a", fontWeight:700 }}>
                       {loading ? "…" : hp ? (p.changePct>0?"▲":"▼")+Math.abs(p.changePct).toFixed(2)+"%" : "—"}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:"#7a9ab8" }}>
                       {loading ? "…" : hp ? p.high.toFixed(2) : "—"}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:"#7a9ab8" }}>
                       {loading ? "…" : hp ? p.low.toFixed(2) : "—"}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right",color:"#4a7a9a"}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right", color:"#4a7a9a" }}>
                       {loading ? "…" : hp ? p.vol.toLocaleString() : "—"}
                     </td>
-                    <td style={{padding:"8px 11px",textAlign:"right"}}>
+                    <td style={{ padding:"8px 11px", textAlign:"right" }}>
                       {isCustom(s.id) && (
-                        <button className="btn" onClick={() => removeCustom(s.id)}
-                          style={{color:"#ff5252",fontSize:17,lineHeight:1}}>×</button>
+                        <button className="btn" onClick={(e) => { e.stopPropagation(); removeCustom(s.id); }}
+                          style={{ color:"#ff5252", fontSize:17, lineHeight:1 }}>×</button>
                       )}
                     </td>
                   </tr>
                 );
               })}
               {filtered.length === 0 && (
-                <tr><td colSpan={11} style={{padding:40,textAlign:"center",color:"#3a6a8a",fontFamily:"'Noto Sans TC'"}}>沒有符合條件的股票</td></tr>
+                <tr><td colSpan={11} style={{ padding:40, textAlign:"center", color:"#3a6a8a", fontFamily:"'Noto Sans TC'" }}>沒有符合條件的股票</td></tr>
               )}
             </tbody>
           </table>
@@ -462,41 +700,50 @@ export default function App() {
       {/* 新增 Modal */}
       {showAdd && (
         <div className="modal-bg" onClick={e => { if(e.target===e.currentTarget){setShowAdd(false);setFormErr("");} }}>
-          <div className="card fu" style={{width:"100%",maxWidth:420,padding:24,borderColor:"#1e3a5f"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
-              <div style={{fontSize:15,fontWeight:700,color:"#00f5a0",fontFamily:"'Noto Sans TC'"}}>＋ 新增股票</div>
-              <button className="btn" onClick={()=>{setShowAdd(false);setFormErr("");}} style={{color:"#3a6a8a",fontSize:22}}>×</button>
+          <div className="card fu" style={{ width:"100%", maxWidth:420, padding:24, borderColor:"#1e3a5f" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+              <div style={{ fontSize:15, fontWeight:700, color:"#00f5a0", fontFamily:"'Noto Sans TC'" }}>＋ 新增股票</div>
+              <button className="btn" onClick={()=>{setShowAdd(false);setFormErr("");}} style={{ color:"#3a6a8a", fontSize:22 }}>×</button>
             </div>
-            <div style={{display:"flex",flexDirection:"column",gap:13}}>
+            <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
               <div>
-                <div style={{fontSize:11,color:"#3a6a8a",marginBottom:5,fontFamily:"'Noto Sans TC'"}}>股票代號 *</div>
+                <div style={{ fontSize:11, color:"#3a6a8a", marginBottom:5, fontFamily:"'Noto Sans TC'" }}>股票代號 *</div>
                 <input className="inp" placeholder="例：0050" value={form.id} onChange={e=>setForm(f=>({...f,id:e.target.value}))}/>
               </div>
               <div>
-                <div style={{fontSize:11,color:"#3a6a8a",marginBottom:5,fontFamily:"'Noto Sans TC'"}}>公司名稱 *</div>
+                <div style={{ fontSize:11, color:"#3a6a8a", marginBottom:5, fontFamily:"'Noto Sans TC'" }}>公司名稱 *</div>
                 <input className="inp" placeholder="例：元大台灣50" value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))}/>
               </div>
               <div>
-                <div style={{fontSize:11,color:"#3a6a8a",marginBottom:5,fontFamily:"'Noto Sans TC'"}}>產業類別</div>
+                <div style={{ fontSize:11, color:"#3a6a8a", marginBottom:5, fontFamily:"'Noto Sans TC'" }}>產業類別</div>
                 <select className="inp" value={form.cat} onChange={e=>setForm(f=>({...f,cat:e.target.value}))}>
                   {[...new Set(STOCK_META.map(s=>s.cat))].map(c=><option key={c} value={c}>{c}</option>)}
                   <option value="其他">其他</option>
                 </select>
               </div>
               <div>
-                <div style={{fontSize:11,color:"#3a6a8a",marginBottom:5,fontFamily:"'Noto Sans TC'"}}>角色定位（選填）</div>
+                <div style={{ fontSize:11, color:"#3a6a8a", marginBottom:5, fontFamily:"'Noto Sans TC'" }}>角色定位（選填）</div>
                 <input className="inp" placeholder="例：ETF 台灣加權指數" value={form.role} onChange={e=>setForm(f=>({...f,role:e.target.value}))}/>
               </div>
-              {formErr && <div style={{fontSize:12,color:"#ff5252",fontFamily:"'Noto Sans TC'"}}>⚠ {formErr}</div>}
-              <div style={{display:"flex",gap:10,marginTop:4}}>
+              {formErr && <div style={{ fontSize:12, color:"#ff5252", fontFamily:"'Noto Sans TC'" }}>⚠ {formErr}</div>}
+              <div style={{ display:"flex", gap:10, marginTop:4 }}>
                 <button className="btn" onClick={()=>{setShowAdd(false);setFormErr("");}}
-                  style={{flex:1,padding:"10px",borderRadius:6,border:"1px solid #1e3a5f",color:"#3a6a8a",fontSize:13,fontFamily:"'Noto Sans TC'"}}>取消</button>
+                  style={{ flex:1, padding:"10px", borderRadius:6, border:"1px solid #1e3a5f", color:"#3a6a8a", fontSize:13, fontFamily:"'Noto Sans TC'" }}>取消</button>
                 <button className="btn" onClick={addStock}
-                  style={{flex:2,padding:"10px",borderRadius:6,background:"#00f5a0",color:"#070b12",fontWeight:700,fontSize:13,fontFamily:"'Noto Sans TC'"}}>確認新增</button>
+                  style={{ flex:2, padding:"10px", borderRadius:6, background:"#00f5a0", color:"#070b12", fontWeight:700, fontSize:13, fontFamily:"'Noto Sans TC'" }}>確認新增</button>
               </div>
             </div>
           </div>
         </div>
+      )}
+
+      {/* 個股 K線詳情 Modal */}
+      {selectedStock && (
+        <StockModal
+          stock={selectedStock}
+          priceInfo={prices[selectedStock.id]}
+          onClose={() => setSelectedStock(null)}
+        />
       )}
     </div>
   );
