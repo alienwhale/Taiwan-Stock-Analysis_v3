@@ -490,9 +490,46 @@ export default function App() {
   const [formErr,setFormErr]=useState(""); const [selectedStock,setSelectedStock]=useState(null);
   const [hidden,setHidden]=useState(()=>{try{return JSON.parse(localStorage.getItem("twstock_hidden")||"[]")}catch{return[]}});
   const [showHidden,setShowHidden]=useState(false);
+  const [autoRefresh,setAutoRefresh]=useState(false);
+  const [countdown,setCountdown]=useState(0);
 
   async function fetchPrices(){setLoading(true);setError("");try{const res=await fetch("/api/prices");if(!res.ok)throw new Error("API "+res.status);const text=await res.text();const data=parseCSV(text);if(Object.keys(data).length===0)throw new Error("無資料");setPrices(data);setLastFetch(new Date().toLocaleTimeString("zh-TW"));}catch(e){setError(e.message);}setLoading(false);}
-  useEffect(()=>{fetchPrices();},[]);
+
+  // 判斷是否在台股交易時段（週一~週五 9:00-13:30 台灣時間）
+  function isTradingHours() {
+    const now = new Date();
+    const tw = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+    const day = tw.getDay();
+    const h = tw.getHours();
+    const m = tw.getMinutes();
+    const time = h * 60 + m;
+    return day >= 1 && day <= 5 && time >= 540 && time <= 810; // 9:00~13:30
+  }
+
+  // 自動刷新：交易時段每30秒
+  useEffect(()=>{
+    fetchPrices();
+    const checkInterval = setInterval(() => {
+      const trading = isTradingHours();
+      setAutoRefresh(trading);
+    }, 5000);
+    return () => clearInterval(checkInterval);
+  },[]);
+
+  useEffect(()=>{
+    if (!autoRefresh) { setCountdown(0); return; }
+    setCountdown(30);
+    const timer = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) {
+          fetchPrices();
+          return 30;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  },[autoRefresh]);
 
   const allStocks=useMemo(()=>{const ids=new Set(STOCK_META.map(s=>s.id));return[...STOCK_META,...custom.filter(s=>!ids.has(s.id))];},[custom]);
   const hiddenSet=useMemo(()=>new Set(hidden),[hidden]);
@@ -515,7 +552,7 @@ export default function App() {
       <div style={{background:"#060a10",borderBottom:"1px solid #192d44",padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
         <div>
           <div style={{fontSize:17,fontWeight:700,color:"#00f5a0",fontFamily:"'Noto Sans TC'",letterSpacing:1}}>📋 台股精選清單</div>
-          <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>共 <span style={{color:"#00f5a0",fontWeight:700}}>{visibleStocks.length}</span> 支 · 19大產業精選{custom.length>0&&<span style={{color:"#ffd54f"}}> · 自訂 {custom.length}</span>}{hidden.length>0&&<span style={{color:"#ff8a65"}}> · 隱藏 {hidden.length}</span>}{lastFetch&&<span> · 更新 {lastFetch}</span>}</div>
+          <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>共 <span style={{color:"#00f5a0",fontWeight:700}}>{visibleStocks.length}</span> 支 · 19大產業精選{custom.length>0&&<span style={{color:"#ffd54f"}}> · 自訂 {custom.length}</span>}{hidden.length>0&&<span style={{color:"#ff8a65"}}> · 隱藏 {hidden.length}</span>}{lastFetch&&<span> · 更新 {lastFetch}</span>}{autoRefresh&&<span style={{color:"#4fc3f7"}}> · 🔴 即時 {countdown}s</span>}</div>
         </div>
         <div style={{display:"flex",gap:8}}>
           <button className="btn" onClick={fetchPrices} disabled={loading} style={{padding:"7px 14px",borderRadius:6,border:"1px solid #1e3a5f",color:"#4a8aaa",fontSize:13,fontFamily:"'Noto Sans TC'"}}>{loading?<span className="spin">⟳</span>:"⟳"} 更新</button>
