@@ -1,11 +1,6 @@
-// api/prices.js — v6
-// 六層資料源 + 修正週末漲跌為0的問題
-// Layer 1: Fugle Snapshot（即時）
-// Layer 2: TWSE/TPEx OpenAPI（免費）
-// Layer 3: Fugle 個股報價（補抓）
-// Layer 4: Yahoo Finance（補抓 + 修正漲跌=0）★修正重點
-// Layer 5: Alpha Vantage（最後補抓，每日25次限制）
-// Layer 6: Google Sheet CSV（備援）
+// api/prices.js — v7
+// 六層資料源 + debug 模式 + 修正漲跌=0
+// 加 ?debug=1 可查看每支股票的資料來源
 
 import yahooFinance from "yahoo-finance2";
 
@@ -39,20 +34,15 @@ const TSE_SET = new Set([
   "2412","2409","2881"
 ]);
 
-function yahooSymbol(id) {
-  return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`;
-}
-
-function avSymbol(id) {
-  return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`;
-}
+function yahooSym(id) { return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`; }
+function avSym(id) { return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`; }
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-
+  const debug = req.query.debug === '1';
   const fugleKey = process.env.FUGLE_API_KEY;
   const avKey = process.env.ALPHA_VANTAGE_KEY;
-  const found = {};
+  const found = {}; // { id: { price, change, changePct, high, low, vol, source } }
 
   // ── Layer 1：Fugle Snapshot ────────────────────
   if (fugleKey) {
@@ -71,7 +61,7 @@ export default async function handler(req, res) {
     ]);
   }
 
-  // ── Layer 3：Fugle 個股報價（補抓完全沒資料的）──
+  // ── Layer 3：Fugle 個股報價 ───────────────────
   missing = ALL_IDS.filter(id => !found[id]);
   if (missing.length > 0 && missing.length <= 60 && fugleKey) {
     const batchSize = 10;
@@ -81,22 +71,48 @@ export default async function handler(req, res) {
     }
   }
 
-  // ── Layer 4：Yahoo Finance ─────────────────────
-  // ★ 修正重點：不只補抓沒資料的，也修正「有價格但漲跌=0」的
-  const needYahoo = ALL_IDS.filter(id =>
+  // ── Layer 4：Yahoo Finance（補抓 + 修正漲跌=0）──
+  const needFix = ALL_IDS.filter(id =>
     !found[id] || (found[id] && found[id].change === 0 && found[id].price > 0)
   );
-  if (needYahoo.length > 0) {
-    await fetchYahooFinance(needYahoo, found);
+  if (needFix.length > 0) {
+    await fetchYahooFinance(needFix, found);
   }
 
-  // ── Layer 5：Alpha Vantage（補抓仍然沒資料的）──
+  // ── Layer 5：Alpha Vantage ────────────────────
   missing = ALL_IDS.filter(id => !found[id]);
   if (missing.length > 0 && avKey) {
     await fetchAlphaVantage(missing, avKey, found);
   }
 
-  // 組裝 CSV
+  // ── debug 模式：回傳 JSON 含資料來源 ──────────
+  if (debug) {
+    const result = ALL_IDS.map(id => {
+      const d = found[id];
+      return {
+        id,
+        market: TSE_SET.has(id) ? 'TSE' : 'OTC',
+        price: d ? d.price : null,
+        change: d ? d.change : null,
+        changePct: d ? d.changePct : null,
+        source: d ? d.source : 'none',
+        status: !d ? '❌ 無資料' : (d.change === 0 ? '⚠️ 漲跌=0' : '✅'),
+      };
+    });
+    const summary = {
+      total: ALL_IDS.length,
+      hasData: result.filter(r => r.price).length,
+      noData: result.filter(r => !r.price).length,
+      zeroChange: result.filter(r => r.price && r.change === 0).length,
+      bySource: {},
+    };
+    result.forEach(r => {
+      if (r.source) summary.bySource[r.source] = (summary.bySource[r.source] || 0) + 1;
+    });
+    return res.status(200).json({ summary, stocks: result });
+  }
+
+  // ── 組裝 CSV ──────────────────────────────────
   const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
   const rows = [];
   ALL_IDS.forEach(id => {
@@ -106,10 +122,7 @@ export default async function handler(req, res) {
     }
   });
 
-  // ── Layer 6：全失敗走 Google Sheet ─────────────
-  if (rows.length === 0) {
-    return fallbackToSheet(res);
-  }
+  if (rows.length === 0) return fallbackToSheet(res);
 
   const header = "代號,股價,漲跌,漲跌%,最高,最低,成交量(張),更新時間";
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -131,13 +144,24 @@ async function fetchFugleSnapshot(market, apiKey, found) {
     const idSet = new Set(ALL_IDS);
     items.forEach(item => {
       const sym = (item.symbol || "").trim();
-      if (idSet.has(sym)) extractFuglePrice(item, sym, found);
+      if (!idSet.has(sym)) return;
+      const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
+      if (price <= 0) return;
+      const prevClose = item.previousClose || item.referencePrice || 0;
+      const change = (item.change !== undefined && item.change !== 0) ? item.change
+        : (prevClose > 0 && prevClose !== price ? +((price - prevClose).toFixed(2)) : 0);
+      const changePct = (item.changePercent !== undefined && item.changePercent !== 0) ? item.changePercent
+        : (prevClose > 0 && prevClose !== price ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0);
+      const high = item.highPrice || item.dayHigh || item.highestPrice || price;
+      const low = item.lowPrice || item.dayLow || item.lowestPrice || price;
+      const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
+      found[sym] = { price, change, changePct, high, low, vol, source: 'L1-Fugle' };
     });
   } catch (e) { /* 靜默 */ }
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 2a: TWSE OpenAPI（上市，免費）
+//  Layer 2a: TWSE OpenAPI
 // ═══════════════════════════════════════════════════
 async function fetchTWSE_OpenAPI(found) {
   try {
@@ -157,13 +181,13 @@ async function fetchTWSE_OpenAPI(found) {
       const vol = Math.round(parseFloat((item.TradeVolume || "0").replace(/,/g, "")) / 1000);
       const yClose = price - change;
       const changePct = yClose > 0 ? +((change / yClose) * 100).toFixed(2) : 0;
-      if (price > 0) found[id] = { price, change, changePct, high, low, vol };
+      if (price > 0) found[id] = { price, change, changePct, high, low, vol, source: 'L2-TWSE' };
     });
   } catch (e) { /* 靜默 */ }
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 2b: TPEx OpenAPI（上櫃，免費）
+//  Layer 2b: TPEx OpenAPI
 // ═══════════════════════════════════════════════════
 async function fetchTPEx_OpenAPI(found) {
   const endpoints = [
@@ -187,7 +211,7 @@ async function fetchTPEx_OpenAPI(found) {
         const vol = Math.round(parseFloat((item.TradingShares || item.Volume || "0").toString().replace(/,/g, "")) / 1000);
         const change = yClose > 0 ? +((price - yClose).toFixed(2)) : 0;
         const changePct = yClose > 0 ? +(((price - yClose) / yClose * 100).toFixed(2)) : 0;
-        if (price > 0) found[id] = { price, change, changePct, high, low, vol };
+        if (price > 0) found[id] = { price, change, changePct, high, low, vol, source: 'L2-TPEx' };
       });
       break;
     } catch (e) { continue; }
@@ -202,14 +226,21 @@ async function fetchFugleQuote(symbol, apiKey, found) {
     const url = `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${symbol}`;
     const resp = await fetch(url, { headers: { 'X-API-KEY': apiKey } });
     if (!resp.ok) return;
-    const json = await resp.json();
-    extractFuglePrice(json, symbol, found);
+    const item = await resp.json();
+    const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
+    if (price <= 0) return;
+    const prevClose = item.previousClose || item.referencePrice || 0;
+    const change = prevClose > 0 && prevClose !== price ? +((price - prevClose).toFixed(2)) : 0;
+    const changePct = prevClose > 0 && prevClose !== price ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
+    const high = item.highPrice || item.dayHigh || price;
+    const low = item.lowPrice || item.dayLow || price;
+    const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
+    found[symbol] = { price, change, changePct, high, low, vol, source: 'L3-FugleQ' };
   } catch (e) { /* 靜默 */ }
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 4: Yahoo Finance
-//  ★ 修正：也修正已有價格但漲跌=0的股票（覆蓋寫入）
+//  Layer 4: Yahoo Finance（補抓 + 修正漲跌=0）
 // ═══════════════════════════════════════════════════
 async function fetchYahooFinance(ids, found) {
   const batchSize = 10;
@@ -217,8 +248,7 @@ async function fetchYahooFinance(ids, found) {
     const batch = ids.slice(i, i + batchSize);
     await Promise.all(batch.map(async (id) => {
       try {
-        const sym = yahooSymbol(id);
-        const r = await yahooFinance.quote(sym);
+        const r = await yahooFinance.quote(yahooSym(id));
         if (!r || !r.regularMarketPrice) return;
 
         const price = r.regularMarketPrice || 0;
@@ -227,13 +257,19 @@ async function fetchYahooFinance(ids, found) {
         const low = r.regularMarketDayLow || price;
         const vol = Math.round((r.regularMarketVolume || 0) / 1000);
 
-        // 永遠自己計算漲跌（不信任 API 的 change，週末常為 0）
+        // 自己算漲跌，不信任 API
         const change = prevClose > 0 ? +((price - prevClose).toFixed(2)) : 0;
         const changePct = prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
 
-        // 只有 Yahoo 算出的漲跌不為0，或者原本就沒資料，才覆蓋
-        if (price > 0 && (change !== 0 || !found[id])) {
-          found[id] = { price, change, changePct, high, low, vol };
+        if (price > 0) {
+          // 無資料 → 直接寫入
+          // 已有資料但漲跌=0 且 Yahoo 算出非0 → 覆蓋
+          // 已有資料且漲跌非0 → 不覆蓋
+          if (!found[id]) {
+            found[id] = { price, change, changePct, high, low, vol, source: 'L4-Yahoo' };
+          } else if (found[id].change === 0 && change !== 0) {
+            found[id] = { price, change, changePct, high, low, vol, source: 'L4-Yahoo(fix)' };
+          }
         }
       } catch (e) { /* 靜默 */ }
     }));
@@ -241,55 +277,29 @@ async function fetchYahooFinance(ids, found) {
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 5: Alpha Vantage（每日25次限制，只補最後剩餘）
+//  Layer 5: Alpha Vantage
 // ═══════════════════════════════════════════════════
 async function fetchAlphaVantage(ids, apiKey, found) {
-  // Alpha Vantage 免費版每日25次，只補最多20支
   const toFetch = ids.slice(0, 20);
   for (const id of toFetch) {
     try {
-      const sym = avSymbol(id);
-      const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${sym}&apikey=${apiKey}`;
+      const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${avSym(id)}&apikey=${apiKey}`;
       const resp = await fetch(url);
       if (!resp.ok) continue;
       const json = await resp.json();
       const q = json["Global Quote"];
       if (!q || !q["05. price"]) continue;
-
       const price = parseFloat(q["05. price"]) || 0;
-      const prevClose = parseFloat(q["08. previous close"]) || 0;
       const change = parseFloat(q["09. change"]) || 0;
       const changePctStr = (q["10. change percent"] || "0").replace("%", "");
       const changePct = parseFloat(changePctStr) || 0;
       const high = parseFloat(q["03. high"]) || price;
       const low = parseFloat(q["04. low"]) || price;
       const vol = Math.round(parseFloat(q["06. volume"] || "0") / 1000);
-
-      if (price > 0) found[id] = { price, change, changePct, high, low, vol };
+      if (price > 0) found[id] = { price, change, changePct, high, low, vol, source: 'L5-AlphaV' };
     } catch (e) { /* 靜默 */ }
-
-    // Alpha Vantage 免費版限制 5次/分鐘，等一下
     await new Promise(r => setTimeout(r, 1200));
   }
-}
-
-// ═══════════════════════════════════════════════════
-//  Fugle 價格提取
-// ═══════════════════════════════════════════════════
-function extractFuglePrice(item, symbol, found) {
-  const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
-  if (price <= 0) return;
-  const prevClose = item.previousClose || item.referencePrice || item.openPrice || price;
-  const change = item.change !== undefined && item.change !== 0
-    ? item.change
-    : (prevClose !== price ? +((price - prevClose).toFixed(2)) : 0);
-  const changePct = item.changePercent !== undefined && item.changePercent !== 0
-    ? item.changePercent
-    : (prevClose > 0 && prevClose !== price ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0);
-  const high = item.highPrice || item.dayHigh || item.highestPrice || price;
-  const low = item.lowPrice || item.dayLow || item.lowestPrice || price;
-  const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
-  found[symbol] = { price, change, changePct, high, low, vol };
 }
 
 // ═══════════════════════════════════════════════════
