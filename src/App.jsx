@@ -85,7 +85,6 @@ const STOCK_META = [
   {id:"1504",name:"東元",cat:"能源重電",role:"馬達/重電"},
   {id:"8996",name:"高力",cat:"能源重電",role:"熱交換器/散熱"},
   {id:"1605",name:"華新",cat:"能源重電",role:"電線電纜"},
-  {id:"6806",name:"森崴能源",cat:"能源重電",role:"風力發電"},
   {id:"1503",name:"大同",cat:"能源重電",role:"重電/能源"},
   {id:"3708",name:"上緯投控",cat:"能源重電",role:"離岸風電材料"},
   {id:"1517",name:"士電",cat:"能源重電",role:"重電設備"},
@@ -489,17 +488,25 @@ export default function App() {
   const [custom,setCustom]=useState(()=>{try{return JSON.parse(localStorage.getItem("twstock_custom")||"[]")}catch{return[]}});
   const [showAdd,setShowAdd]=useState(false); const [form,setForm]=useState({id:"",name:"",cat:"核心製造",role:""});
   const [formErr,setFormErr]=useState(""); const [selectedStock,setSelectedStock]=useState(null);
+  const [hidden,setHidden]=useState(()=>{try{return JSON.parse(localStorage.getItem("twstock_hidden")||"[]")}catch{return[]}});
+  const [showHidden,setShowHidden]=useState(false);
 
   async function fetchPrices(){setLoading(true);setError("");try{const res=await fetch("/api/prices");if(!res.ok)throw new Error("API "+res.status);const text=await res.text();const data=parseCSV(text);if(Object.keys(data).length===0)throw new Error("無資料");setPrices(data);setLastFetch(new Date().toLocaleTimeString("zh-TW"));}catch(e){setError(e.message);}setLoading(false);}
   useEffect(()=>{fetchPrices();},[]);
 
   const allStocks=useMemo(()=>{const ids=new Set(STOCK_META.map(s=>s.id));return[...STOCK_META,...custom.filter(s=>!ids.has(s.id))];},[custom]);
-  const allCats=useMemo(()=>["全部",...([...new Set(allStocks.map(s=>s.cat))])]  ,[allStocks]);
-  const filtered=useMemo(()=>allStocks.filter(s=>(cat==="全部"||s.cat===cat)&&(q===""||s.id.includes(q)||s.name.includes(q)||s.role.includes(q))),[allStocks,cat,q]);
+  const hiddenSet=useMemo(()=>new Set(hidden),[hidden]);
+  const visibleStocks=useMemo(()=>allStocks.filter(s=>!hiddenSet.has(s.id)),[allStocks,hiddenSet]);
+  const allCats=useMemo(()=>["全部",...([...new Set(visibleStocks.map(s=>s.cat))])]  ,[visibleStocks]);
+  const filtered=useMemo(()=>visibleStocks.filter(s=>(cat==="全部"||s.cat===cat)&&(q===""||s.id.includes(q)||s.name.includes(q)||s.role.includes(q))),[visibleStocks,cat,q]);
 
   function addStock(){if(!form.id.trim()){setFormErr("請輸入代號");return;}if(!form.name.trim()){setFormErr("請輸入名稱");return;}if(allStocks.find(s=>s.id===form.id.trim())){setFormErr("此代號已存在");return;}const next=[...custom,{id:form.id.trim(),name:form.name.trim(),cat:form.cat,role:form.role.trim()||"自訂"}];setCustom(next);try{localStorage.setItem("twstock_custom",JSON.stringify(next));}catch(_){}setForm({id:"",name:"",cat:"核心製造",role:""});setFormErr("");setShowAdd(false);}
   function removeCustom(id){const next=custom.filter(s=>s.id!==id);setCustom(next);try{localStorage.setItem("twstock_custom",JSON.stringify(next));}catch(_){}}
+  function hideStock(id){const next=[...hidden,id];setHidden(next);try{localStorage.setItem("twstock_hidden",JSON.stringify(next));}catch(_){}}
+  function unhideStock(id){const next=hidden.filter(h=>h!==id);setHidden(next);try{localStorage.setItem("twstock_hidden",JSON.stringify(next));}catch(_){}}
+  function removeStock(id){if(isCustom(id)){removeCustom(id);}else{hideStock(id);}}
   const isCustom=id=>custom.some(s=>s.id===id);
+  const hiddenStocks=useMemo(()=>allStocks.filter(s=>hiddenSet.has(s.id)),[allStocks,hiddenSet]);
 
   return (
     <div style={{minHeight:"100vh",background:"#070b12",color:"#dce8f0",fontFamily:"'IBM Plex Mono','Courier New',monospace"}}>
@@ -508,10 +515,11 @@ export default function App() {
       <div style={{background:"#060a10",borderBottom:"1px solid #192d44",padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
         <div>
           <div style={{fontSize:17,fontWeight:700,color:"#00f5a0",fontFamily:"'Noto Sans TC'",letterSpacing:1}}>📋 台股精選清單</div>
-          <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>共 <span style={{color:"#00f5a0",fontWeight:700}}>{allStocks.length}</span> 支 · 19大產業精選{custom.length>0&&<span style={{color:"#ffd54f"}}> · 自訂 {custom.length}</span>}{lastFetch&&<span> · 更新 {lastFetch}</span>}</div>
+          <div style={{fontSize:10,color:"#3a6a8a",marginTop:2}}>共 <span style={{color:"#00f5a0",fontWeight:700}}>{visibleStocks.length}</span> 支 · 19大產業精選{custom.length>0&&<span style={{color:"#ffd54f"}}> · 自訂 {custom.length}</span>}{hidden.length>0&&<span style={{color:"#ff8a65"}}> · 隱藏 {hidden.length}</span>}{lastFetch&&<span> · 更新 {lastFetch}</span>}</div>
         </div>
         <div style={{display:"flex",gap:8}}>
           <button className="btn" onClick={fetchPrices} disabled={loading} style={{padding:"7px 14px",borderRadius:6,border:"1px solid #1e3a5f",color:"#4a8aaa",fontSize:13,fontFamily:"'Noto Sans TC'"}}>{loading?<span className="spin">⟳</span>:"⟳"} 更新</button>
+          {hidden.length>0&&<button className="btn" onClick={()=>setShowHidden(true)} style={{padding:"7px 14px",borderRadius:6,border:"1px solid #ff8a65",color:"#ff8a65",fontSize:12,fontFamily:"'Noto Sans TC'"}}>隱藏 {hidden.length}</button>}
           <button className="btn" onClick={()=>setShowAdd(true)} style={{background:"#00f5a0",color:"#070b12",padding:"7px 16px",borderRadius:6,fontWeight:700,fontSize:13,fontFamily:"'Noto Sans TC'"}}>＋ 新增股票</button>
         </div>
       </div>
@@ -547,7 +555,7 @@ export default function App() {
                   <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>{loading?"…":hp?p.high.toFixed(2):"—"}</td>
                   <td style={{padding:"8px 11px",textAlign:"right",color:"#7a9ab8"}}>{loading?"…":hp?p.low.toFixed(2):"—"}</td>
                   <td style={{padding:"8px 11px",textAlign:"right",color:"#4a7a9a"}}>{loading?"…":hp?p.vol.toLocaleString():"—"}</td>
-                  <td style={{padding:"8px 11px",textAlign:"right"}}>{isCustom(s.id)&&<button className="btn" onClick={e=>{e.stopPropagation();removeCustom(s.id);}} style={{color:"#ff5252",fontSize:17,lineHeight:1}}>×</button>}</td>
+                  <td style={{padding:"8px 11px",textAlign:"right"}}><button className="btn" onClick={e=>{e.stopPropagation();removeStock(s.id);}} style={{color:"#ff5252",fontSize:15,lineHeight:1,opacity:0.4}} onMouseOver={e=>e.target.style.opacity=1} onMouseOut={e=>e.target.style.opacity=0.4}>×</button></td>
                 </tr>);})}
               {filtered.length===0&&<tr><td colSpan={11} style={{padding:40,textAlign:"center",color:"#3a6a8a",fontFamily:"'Noto Sans TC'"}}>沒有符合條件的股票</td></tr>}
             </tbody>
@@ -573,6 +581,30 @@ export default function App() {
       </div>)}
 
       {selectedStock&&<StockModal stock={selectedStock} priceInfo={prices[selectedStock.id]} onClose={()=>setSelectedStock(null)} />}
+
+      {/* 管理隱藏股票 Modal */}
+      {showHidden&&(<div className="modal-bg" onClick={e=>{if(e.target===e.currentTarget)setShowHidden(false);}}>
+        <div className="card fu" style={{width:"100%",maxWidth:500,padding:24,borderColor:"#1e3a5f",maxHeight:"80vh",overflow:"auto"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div style={{fontSize:15,fontWeight:700,color:"#ff8a65",fontFamily:"'Noto Sans TC'"}}>已隱藏的股票（{hiddenStocks.length}支）</div>
+            <button className="btn" onClick={()=>setShowHidden(false)} style={{color:"#3a6a8a",fontSize:22}}>×</button>
+          </div>
+          {hiddenStocks.length===0?<div style={{padding:30,textAlign:"center",color:"#3a6a8a",fontFamily:"'Noto Sans TC'"}}>沒有隱藏的股票</div>:
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {hiddenStocks.map(s=>(
+              <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",background:"#070b12",borderRadius:6}}>
+                <div>
+                  <span style={{color:"#00c876",fontWeight:700,marginRight:8}}>{s.id}</span>
+                  <span style={{color:"#e0e8f0",fontFamily:"'Noto Sans TC'",fontSize:13}}>{s.name}</span>
+                  <span style={{color:"#3a6a8a",fontSize:11,marginLeft:8}}>{s.cat}</span>
+                </div>
+                <button className="btn" onClick={()=>unhideStock(s.id)} style={{padding:"4px 12px",borderRadius:5,border:"1px solid #00f5a0",color:"#00f5a0",fontSize:11,fontFamily:"'Noto Sans TC'"}}>恢復</button>
+              </div>
+            ))}
+            <button className="btn" onClick={()=>{setHidden([]);try{localStorage.setItem("twstock_hidden","[]");}catch(_){}}} style={{marginTop:10,padding:"8px",borderRadius:6,border:"1px solid #ff8a65",color:"#ff8a65",fontSize:12,fontFamily:"'Noto Sans TC'",width:"100%"}}>全部恢復</button>
+          </div>}
+        </div>
+      </div>)}
     </div>
   );
 }
