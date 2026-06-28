@@ -1,10 +1,10 @@
-// api/prices.js — v4
-// 五層資料源，確保 90 支都有股價：
-// Layer 1: Fugle Snapshot API（即時，需 API Key）
-// Layer 2: TWSE/TPEx OpenAPI（免費，不需 Key）
-// Layer 3: Fugle 個股報價（逐一補抓）
-// Layer 4: Yahoo Finance（免費，涵蓋廣）
-// Layer 5: Google Sheet CSV（最後備援）
+// api/prices.js — v5
+// 五層資料源 + 週末/假日自動顯示最後交易日正確漲跌
+// Layer 1: Fugle Snapshot API
+// Layer 2: TWSE/TPEx OpenAPI
+// Layer 3: Fugle 個股報價
+// Layer 4: Yahoo Finance
+// Layer 5: Google Sheet CSV
 
 import yahooFinance from "yahoo-finance2";
 
@@ -28,7 +28,6 @@ const ALL_IDS = [
   "2412","2409","2881"
 ];
 
-// 上市股票用 .TW，上櫃用 .TWO
 const TSE_SET = new Set([
   "2330","3711","2449","2454","2379","3034",
   "2317","2382","3231","2376","2345","2301",
@@ -41,6 +40,25 @@ const TSE_SET = new Set([
 
 function yahooSymbol(id) {
   return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`;
+}
+
+// 統一漲跌計算：確保 change 不是 0（除非真的是平盤）
+function calcChange(price, prevClose, apiChange, apiChangePct) {
+  // 如果 API 給的 change 是 0 但 price != prevClose，自己算
+  let change = apiChange;
+  let changePct = apiChangePct;
+
+  if (change === 0 && prevClose > 0 && Math.abs(price - prevClose) > 0.001) {
+    change = +((price - prevClose).toFixed(2));
+    changePct = +(((price - prevClose) / prevClose * 100).toFixed(2));
+  }
+
+  // 如果完全沒有 prevClose 資訊，change 保持 API 給的值
+  if (changePct === undefined || changePct === null) {
+    changePct = prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
+  }
+
+  return { change, changePct };
 }
 
 export default async function handler(req, res) {
@@ -137,12 +155,12 @@ async function fetchTWSE_OpenAPI(found) {
       const id = (item.Code || "").trim();
       if (!idSet.has(id) || found[id]) return;
       const price = parseFloat((item.ClosingPrice || "0").replace(/,/g, "")) || 0;
-      const change = parseFloat((item.Change || "0").replace(/[+,]/g, "")) || 0;
+      const apiChange = parseFloat((item.Change || "0").replace(/[+,]/g, "")) || 0;
       const high = parseFloat((item.HighestPrice || "0").replace(/,/g, "")) || 0;
       const low = parseFloat((item.LowestPrice || "0").replace(/,/g, "")) || 0;
       const vol = Math.round(parseFloat((item.TradeVolume || "0").replace(/,/g, "")) / 1000);
-      const yClose = price - change;
-      const changePct = yClose > 0 ? +((change / yClose) * 100).toFixed(2) : 0;
+      const yClose = price - apiChange;
+      const { change, changePct } = calcChange(price, yClose, apiChange, yClose > 0 ? +((apiChange / yClose) * 100).toFixed(2) : 0);
       if (price > 0) found[id] = { price, change, changePct, high, low, vol };
     });
   } catch (e) { /* 靜默 */ }
@@ -171,8 +189,9 @@ async function fetchTPEx_OpenAPI(found) {
         const high = parseFloat(item.HighestPrice || item.High || "0") || price;
         const low = parseFloat(item.LowestPrice || item.Low || "0") || price;
         const vol = Math.round(parseFloat((item.TradingShares || item.Volume || "0").toString().replace(/,/g, "")) / 1000);
-        const change = yClose > 0 ? +((price - yClose).toFixed(2)) : 0;
-        const changePct = yClose > 0 ? +(((price - yClose) / yClose * 100).toFixed(2)) : 0;
+        const rawChange = yClose > 0 ? +((price - yClose).toFixed(2)) : 0;
+        const rawPct = yClose > 0 ? +(((price - yClose) / yClose * 100).toFixed(2)) : 0;
+        const { change, changePct } = calcChange(price, yClose, rawChange, rawPct);
         if (price > 0) found[id] = { price, change, changePct, high, low, vol };
       });
       break;
@@ -194,47 +213,44 @@ async function fetchFugleQuote(symbol, apiKey, found) {
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 4: Yahoo Finance（批次補抓）
+//  Layer 4: Yahoo Finance（自行計算漲跌，不信任 API 的 0）
 // ═══════════════════════════════════════════════════
 async function fetchYahooFinance(ids, found) {
-  // 分批，每批最多 10 支，避免 timeout
   const batchSize = 10;
   for (let i = 0; i < ids.length; i += batchSize) {
     const batch = ids.slice(i, i + batchSize);
     await Promise.all(batch.map(async (id) => {
       try {
         const sym = yahooSymbol(id);
-        const result = await yahooFinance.quote(sym);
-        if (!result || !result.regularMarketPrice) return;
+        const r = await yahooFinance.quote(sym);
+        if (!r || !r.regularMarketPrice) return;
 
-        const price = result.regularMarketPrice || 0;
-        const prevClose = result.regularMarketPreviousClose || price;
-        const change = result.regularMarketChange !== undefined
-          ? +(result.regularMarketChange.toFixed(2))
-          : +((price - prevClose).toFixed(2));
-        const changePct = result.regularMarketChangePercent !== undefined
-          ? +(result.regularMarketChangePercent.toFixed(2))
-          : (prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0);
-        const high = result.regularMarketDayHigh || price;
-        const low = result.regularMarketDayLow || price;
-        const vol = Math.round((result.regularMarketVolume || 0) / 1000);
+        const price = r.regularMarketPrice || 0;
+        const prevClose = r.regularMarketPreviousClose || 0;
+        const high = r.regularMarketDayHigh || price;
+        const low = r.regularMarketDayLow || price;
+        const vol = Math.round((r.regularMarketVolume || 0) / 1000);
+
+        // 永遠自己從 previousClose 計算漲跌，不信任 API 的 change（週末常為0）
+        const change = prevClose > 0 ? +((price - prevClose).toFixed(2)) : 0;
+        const changePct = prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
 
         if (price > 0) found[id] = { price, change, changePct, high, low, vol };
-      } catch (e) { /* 靜默，單支失敗不影響其他 */ }
+      } catch (e) { /* 靜默 */ }
     }));
   }
 }
 
 // ═══════════════════════════════════════════════════
-//  Fugle 價格提取（通用）
+//  Fugle 價格提取（統一漲跌計算）
 // ═══════════════════════════════════════════════════
 function extractFuglePrice(item, symbol, found) {
   const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
   if (price <= 0) return;
   const prevClose = item.previousClose || item.referencePrice || item.openPrice || price;
-  const change = item.change !== undefined ? item.change : +((price - prevClose).toFixed(2));
-  const changePct = item.changePercent !== undefined ? item.changePercent :
-    (prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0);
+  const apiChange = item.change !== undefined ? item.change : 0;
+  const apiPct = item.changePercent !== undefined ? item.changePercent : 0;
+  const { change, changePct } = calcChange(price, prevClose, apiChange, apiPct);
   const high = item.highPrice || item.dayHigh || item.highestPrice || price;
   const low = item.lowPrice || item.dayLow || item.lowestPrice || price;
   const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
