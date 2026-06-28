@@ -1,6 +1,6 @@
-// api/prices.js — v7
-// 六層資料源 + debug 模式 + 修正漲跌=0
-// 加 ?debug=1 可查看每支股票的資料來源
+// api/prices.js — v8
+// 六層資料源 + Fugle 歷史K線修正漲跌=0
+// 核心修正：漲跌=0 的股票，用 Fugle 歷史 candles 取最後2天收盤價計算
 
 import yahooFinance from "yahoo-finance2";
 
@@ -35,14 +35,13 @@ const TSE_SET = new Set([
 ]);
 
 function yahooSym(id) { return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`; }
-function avSym(id) { return TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`; }
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const debug = req.query.debug === '1';
   const fugleKey = process.env.FUGLE_API_KEY;
   const avKey = process.env.ALPHA_VANTAGE_KEY;
-  const found = {}; // { id: { price, change, changePct, high, low, vol, source } }
+  const found = {};
 
   // ── Layer 1：Fugle Snapshot ────────────────────
   if (fugleKey) {
@@ -64,51 +63,58 @@ export default async function handler(req, res) {
   // ── Layer 3：Fugle 個股報價 ───────────────────
   missing = ALL_IDS.filter(id => !found[id]);
   if (missing.length > 0 && missing.length <= 60 && fugleKey) {
-    const batchSize = 10;
-    for (let i = 0; i < missing.length; i += batchSize) {
-      const batch = missing.slice(i, i + batchSize);
-      await Promise.all(batch.map(id => fetchFugleQuote(id, fugleKey, found)));
+    const bs = 10;
+    for (let i = 0; i < missing.length; i += bs) {
+      await Promise.all(missing.slice(i, i + bs).map(id => fetchFugleQuote(id, fugleKey, found)));
     }
   }
 
-  // ── Layer 4：Yahoo Finance（補抓 + 修正漲跌=0）──
-  const needFix = ALL_IDS.filter(id =>
-    !found[id] || (found[id] && found[id].change === 0 && found[id].price > 0)
-  );
-  if (needFix.length > 0) {
-    await fetchYahooFinance(needFix, found);
+  // ── Layer 4：Yahoo Finance（補抓沒資料的）─────
+  missing = ALL_IDS.filter(id => !found[id]);
+  if (missing.length > 0) {
+    await fetchYahooFinance(missing, found);
   }
 
-  // ── Layer 5：Alpha Vantage ────────────────────
+  // ── Layer 5：Alpha Vantage（補抓沒資料的）─────
   missing = ALL_IDS.filter(id => !found[id]);
   if (missing.length > 0 && avKey) {
     await fetchAlphaVantage(missing, avKey, found);
   }
 
-  // ── debug 模式：回傳 JSON 含資料來源 ──────────
+  // ══ 核心修正：用 Fugle 歷史 K 線修正漲跌=0 ══
+  // 這是最可靠的方法，K線圖已經證實可以正常取得歷史資料
+  if (fugleKey) {
+    const zeroChange = ALL_IDS.filter(id =>
+      found[id] && found[id].price > 0 && found[id].change === 0
+    );
+    if (zeroChange.length > 0) {
+      const bs = 5;
+      for (let i = 0; i < zeroChange.length; i += bs) {
+        await Promise.all(zeroChange.slice(i, i + bs).map(id =>
+          fixChangeFromCandles(id, fugleKey, found)
+        ));
+      }
+    }
+  }
+
+  // ── debug 模式 ────────────────────────────────
   if (debug) {
     const result = ALL_IDS.map(id => {
       const d = found[id];
       return {
-        id,
-        market: TSE_SET.has(id) ? 'TSE' : 'OTC',
-        price: d ? d.price : null,
-        change: d ? d.change : null,
-        changePct: d ? d.changePct : null,
-        source: d ? d.source : 'none',
+        id, market: TSE_SET.has(id) ? 'TSE' : 'OTC',
+        price: d?.price || null, change: d?.change || null,
+        changePct: d?.changePct || null, source: d?.source || 'none',
         status: !d ? '❌ 無資料' : (d.change === 0 ? '⚠️ 漲跌=0' : '✅'),
       };
     });
     const summary = {
       total: ALL_IDS.length,
       hasData: result.filter(r => r.price).length,
-      noData: result.filter(r => !r.price).length,
       zeroChange: result.filter(r => r.price && r.change === 0).length,
       bySource: {},
     };
-    result.forEach(r => {
-      if (r.source) summary.bySource[r.source] = (summary.bySource[r.source] || 0) + 1;
-    });
+    result.forEach(r => { if (r.source) summary.bySource[r.source] = (summary.bySource[r.source] || 0) + 1; });
     return res.status(200).json({ summary, stocks: result });
   }
 
@@ -131,6 +137,55 @@ export default async function handler(req, res) {
 }
 
 // ═══════════════════════════════════════════════════
+//  ★ 核心修正：用 Fugle 歷史 K 線取最後2天收盤價
+//  這跟 K 線圖用的是同一個 API，已確認可正常運作
+// ═══════════════════════════════════════════════════
+async function fixChangeFromCandles(id, apiKey, found) {
+  try {
+    const to = new Date();
+    const from = new Date();
+    from.setDate(from.getDate() - 14); // 取最近14天（確保有2個交易日）
+    const fmt = d => d.toISOString().split('T')[0];
+
+    let url = `https://api.fugle.tw/marketdata/v1.0/stock/historical/candles/${id}?from=${fmt(from)}&to=${fmt(to)}&fields=open,high,low,close,volume`;
+    let resp = await fetch(url, { headers: { 'X-API-KEY': apiKey } });
+
+    // 如果 400，不帶日期再試
+    if (resp.status === 400) {
+      url = `https://api.fugle.tw/marketdata/v1.0/stock/historical/candles/${id}?fields=open,high,low,close,volume`;
+      resp = await fetch(url, { headers: { 'X-API-KEY': apiKey } });
+    }
+
+    if (!resp.ok) return;
+    const json = await resp.json();
+    const candles = (json.data || json.candles || [])
+      .sort((a, b) => new Date(b.date) - new Date(a.date)); // 最新在前
+
+    if (candles.length < 2) return;
+
+    const today = candles[0];     // 最後一個交易日
+    const yesterday = candles[1]; // 前一個交易日
+
+    const price = today.close;
+    const prevClose = yesterday.close;
+    const change = +((price - prevClose).toFixed(2));
+    const changePct = prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
+
+    if (change !== 0) {
+      found[id] = {
+        price,
+        change,
+        changePct,
+        high: today.high || price,
+        low: today.low || price,
+        vol: Math.round((today.volume || 0) / 1000),
+        source: 'Candles-fix'
+      };
+    }
+  } catch (e) { /* 靜默 */ }
+}
+
+// ═══════════════════════════════════════════════════
 //  Layer 1: Fugle Snapshot
 // ═══════════════════════════════════════════════════
 async function fetchFugleSnapshot(market, apiKey, found) {
@@ -148,14 +203,17 @@ async function fetchFugleSnapshot(market, apiKey, found) {
       const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
       if (price <= 0) return;
       const prevClose = item.previousClose || item.referencePrice || 0;
-      const change = (item.change !== undefined && item.change !== 0) ? item.change
+      const change = (item.change && item.change !== 0) ? item.change
         : (prevClose > 0 && prevClose !== price ? +((price - prevClose).toFixed(2)) : 0);
-      const changePct = (item.changePercent !== undefined && item.changePercent !== 0) ? item.changePercent
+      const changePct = (item.changePercent && item.changePercent !== 0) ? item.changePercent
         : (prevClose > 0 && prevClose !== price ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0);
-      const high = item.highPrice || item.dayHigh || item.highestPrice || price;
-      const low = item.lowPrice || item.dayLow || item.lowestPrice || price;
-      const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
-      found[sym] = { price, change, changePct, high, low, vol, source: 'L1-Fugle' };
+      found[sym] = {
+        price, change, changePct,
+        high: item.highPrice || item.dayHigh || price,
+        low: item.lowPrice || item.dayLow || price,
+        vol: Math.round((item.tradeVolume || item.volume || 0) / 1000),
+        source: 'L1-Fugle'
+      };
     });
   } catch (e) { /* 靜默 */ }
 }
@@ -165,8 +223,8 @@ async function fetchFugleSnapshot(market, apiKey, found) {
 // ═══════════════════════════════════════════════════
 async function fetchTWSE_OpenAPI(found) {
   try {
-    const url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL";
-    const resp = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const resp = await fetch("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+      { headers: { "User-Agent": "Mozilla/5.0" } });
     if (!resp.ok) return;
     const data = await resp.json();
     if (!Array.isArray(data)) return;
@@ -190,16 +248,15 @@ async function fetchTWSE_OpenAPI(found) {
 //  Layer 2b: TPEx OpenAPI
 // ═══════════════════════════════════════════════════
 async function fetchTPEx_OpenAPI(found) {
-  const endpoints = [
+  for (const ep of [
     "https://openapi.tpex.org.tw/v1/tpex_mainboard_quotes",
     "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-  ];
-  for (const ep of endpoints) {
+  ]) {
     try {
       const resp = await fetch(ep, { headers: { "User-Agent": "Mozilla/5.0" } });
       if (!resp.ok) continue;
       const data = await resp.json();
-      if (!Array.isArray(data) || data.length === 0) continue;
+      if (!Array.isArray(data) || !data.length) continue;
       const idSet = new Set(ALL_IDS);
       data.forEach(item => {
         const id = (item.SecuritiesCompanyCode || item.Code || item["SecuritiesCompanyCode "] || "").trim();
@@ -221,56 +278,55 @@ async function fetchTPEx_OpenAPI(found) {
 // ═══════════════════════════════════════════════════
 //  Layer 3: Fugle 個股報價
 // ═══════════════════════════════════════════════════
-async function fetchFugleQuote(symbol, apiKey, found) {
+async function fetchFugleQuote(id, apiKey, found) {
   try {
-    const url = `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${symbol}`;
-    const resp = await fetch(url, { headers: { 'X-API-KEY': apiKey } });
+    const resp = await fetch(
+      `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${id}`,
+      { headers: { 'X-API-KEY': apiKey } }
+    );
     if (!resp.ok) return;
     const item = await resp.json();
-    const price = item.closePrice || item.lastPrice || item.tradePrice || item.previousClose || 0;
+    const price = item.closePrice || item.lastPrice || item.tradePrice || 0;
     if (price <= 0) return;
     const prevClose = item.previousClose || item.referencePrice || 0;
     const change = prevClose > 0 && prevClose !== price ? +((price - prevClose).toFixed(2)) : 0;
     const changePct = prevClose > 0 && prevClose !== price ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
-    const high = item.highPrice || item.dayHigh || price;
-    const low = item.lowPrice || item.dayLow || price;
-    const vol = Math.round((item.tradeVolume || item.volume || 0) / 1000);
-    found[symbol] = { price, change, changePct, high, low, vol, source: 'L3-FugleQ' };
+    found[id] = {
+      price, change, changePct,
+      high: item.highPrice || price, low: item.lowPrice || price,
+      vol: Math.round((item.tradeVolume || 0) / 1000),
+      source: 'L3-FugleQ'
+    };
   } catch (e) { /* 靜默 */ }
 }
 
 // ═══════════════════════════════════════════════════
-//  Layer 4: Yahoo Finance（補抓 + 修正漲跌=0）
+//  Layer 4: Yahoo Finance
 // ═══════════════════════════════════════════════════
 async function fetchYahooFinance(ids, found) {
-  const batchSize = 10;
-  for (let i = 0; i < ids.length; i += batchSize) {
-    const batch = ids.slice(i, i + batchSize);
-    await Promise.all(batch.map(async (id) => {
+  const bs = 10;
+  for (let i = 0; i < ids.length; i += bs) {
+    await Promise.all(ids.slice(i, i + bs).map(async id => {
       try {
-        const r = await yahooFinance.quote(yahooSym(id));
+        // 先試 .TWO（上櫃），失敗再試 .TW
+        let r;
+        try {
+          r = await yahooFinance.quote(yahooSym(id));
+        } catch (e1) {
+          // 如果 .TWO 失敗，試 .TW
+          if (!TSE_SET.has(id)) {
+            try { r = await yahooFinance.quote(`${id}.TW`); } catch (e2) { return; }
+          } else { return; }
+        }
         if (!r || !r.regularMarketPrice) return;
-
-        const price = r.regularMarketPrice || 0;
+        const price = r.regularMarketPrice;
         const prevClose = r.regularMarketPreviousClose || 0;
         const high = r.regularMarketDayHigh || price;
         const low = r.regularMarketDayLow || price;
         const vol = Math.round((r.regularMarketVolume || 0) / 1000);
-
-        // 自己算漲跌，不信任 API
         const change = prevClose > 0 ? +((price - prevClose).toFixed(2)) : 0;
         const changePct = prevClose > 0 ? +(((price - prevClose) / prevClose * 100).toFixed(2)) : 0;
-
-        if (price > 0) {
-          // 無資料 → 直接寫入
-          // 已有資料但漲跌=0 且 Yahoo 算出非0 → 覆蓋
-          // 已有資料且漲跌非0 → 不覆蓋
-          if (!found[id]) {
-            found[id] = { price, change, changePct, high, low, vol, source: 'L4-Yahoo' };
-          } else if (found[id].change === 0 && change !== 0) {
-            found[id] = { price, change, changePct, high, low, vol, source: 'L4-Yahoo(fix)' };
-          }
-        }
+        if (price > 0) found[id] = { price, change, changePct, high, low, vol, source: 'L4-Yahoo' };
       } catch (e) { /* 靜默 */ }
     }));
   }
@@ -280,19 +336,17 @@ async function fetchYahooFinance(ids, found) {
 //  Layer 5: Alpha Vantage
 // ═══════════════════════════════════════════════════
 async function fetchAlphaVantage(ids, apiKey, found) {
-  const toFetch = ids.slice(0, 20);
-  for (const id of toFetch) {
+  for (const id of ids.slice(0, 20)) {
     try {
-      const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${avSym(id)}&apikey=${apiKey}`;
-      const resp = await fetch(url);
+      const sym = TSE_SET.has(id) ? `${id}.TW` : `${id}.TWO`;
+      const resp = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${sym}&apikey=${apiKey}`);
       if (!resp.ok) continue;
       const json = await resp.json();
       const q = json["Global Quote"];
       if (!q || !q["05. price"]) continue;
       const price = parseFloat(q["05. price"]) || 0;
       const change = parseFloat(q["09. change"]) || 0;
-      const changePctStr = (q["10. change percent"] || "0").replace("%", "");
-      const changePct = parseFloat(changePctStr) || 0;
+      const changePct = parseFloat((q["10. change percent"] || "0").replace("%", "")) || 0;
       const high = parseFloat(q["03. high"]) || price;
       const low = parseFloat(q["04. low"]) || price;
       const vol = Math.round(parseFloat(q["06. volume"] || "0") / 1000);
